@@ -31,19 +31,32 @@ agent = PurchasingAgent()
 
 @app.get("/health")
 def health_check():
-    """Verifica a integridade do backend e da conexão com o banco de dados."""
+    """Verifica a integridade do backend e da conexao com o banco de dados."""
+    db_type = "none"
     db_ok = False
-    try:
-        conn = database.get_connection()
-        conn.close()
-        db_ok = True
-    except Exception as e:
-        logger.warning("Falha na conexão com banco no health check: %s", str(e))
+    conn = database.get_connection()
+    if conn:
+        try:
+            conn.close()
+            db_ok = True
+            db_type = "postgresql"
+        except Exception:
+            pass
+
+    if not db_ok:
+        try:
+            s_conn = database.get_sqlite_connection()
+            s_conn.close()
+            db_ok = True
+            db_type = "sqlite_fallback"
+        except Exception:
+            pass
 
     return {
-        "status": "ok" if db_ok else "degraded",
+        "status": "ok" if db_ok else "error",
         "service": "backend",
         "database_connected": db_ok,
+        "database_type": db_type,
         "model": agent.model
     }
 

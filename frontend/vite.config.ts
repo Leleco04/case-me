@@ -14,5 +14,16 @@ export default defineConfig({
         rewrite: (path) => path.replace(/^\/api/, '')
       }
     }
+  },
+  preview: {
+    port: 3000,
+    host: true,
+    proxy: {
+      '/api': {
+        target: process.env.VITE_BACKEND_URL || 'http://localhost:8000',
+        changeOrigin: true,
+        rewrite: (path) => path.replace(/^\/api/, '')
+      }
+    }
   }
 })
