@@ -1,0 +1,255 @@
+import os
+import logging
+from typing import List, Dict, Any, Optional
+import httpx
+import psycopg2
+from psycopg2.extras import RealDictCursor
+
+logger = logging.getLogger("mcp_tools")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+
+DUMMYJSON_BASE_URL = os.getenv("DUMMYJSON_BASE_URL", "https://dummyjson.com")
+DATABASE_URL = os.getenv(
+    "DATABASE_URL",
+    "postgresql://admin:admin@postgres:5432/compras"
+)
+HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "10.0"))
+USER_AGENT = "PurchasingAgent/1.0 (Mozilla/5.0; Windows NT 10.0; Win64; x64)"
+
+
+def _get_http_headers() -> Dict[str, str]:
+    return {
+        "User-Agent": USER_AGENT,
+        "Accept": "application/json"
+    }
+
+
+def buscar_produtos(termo: str) -> Dict[str, Any]:
+    """
+    Busca produtos no catálogo da DummyJSON utilizando o endpoint de busca.
+    Trata erros de conexão, status HTTP e timeout de forma resiliente.
+    """
+    if not termo or not termo.strip():
+        return {
+            "sucesso": False,
+            "erro": "Termo de busca não pode ser vazio.",
+            "total": 0,
+            "produtos": []
+        }
+
+    url = f"{DUMMYJSON_BASE_URL}/products/search"
+    params = {"q": termo.strip()}
+
+    try:
+        with httpx.Client(timeout=HTTP_TIMEOUT, headers=_get_http_headers()) as client:
+            response = client.get(url, params=params)
+            response.raise_for_status()
+            data = response.json()
+
+            produtos_brutos = data.get("products", [])
+            produtos_formatados = []
+
+            for p in produtos_brutos:
+                produtos_formatados.append({
+                    "id": p.get("id"),
+                    "title": p.get("title"),
+                    "description": p.get("description"),
+                    "category": p.get("category"),
+                    "price": p.get("price"),
+                    "discountPercentage": p.get("discountPercentage"),
+                    "rating": p.get("rating"),
+                    "stock": p.get("stock"),
+                    "brand": p.get("brand")
+                })
+
+            logger.info("Busca por '%s' retornou %d produtos.", termo, len(produtos_formatados))
+            return {
+                "sucesso": True,
+                "termo": termo,
+                "total": len(produtos_formatados),
+                "produtos": produtos_formatados
+            }
+
+    except httpx.TimeoutException:
+        logger.error("Timeout ao consultar DummyJSON para o termo '%s'", termo)
+        return {
+            "sucesso": False,
+            "erro": f"Tempo limite de {HTTP_TIMEOUT}s excedido ao buscar produtos na DummyJSON. O serviço pode estar lento.",
+            "produtos": []
+        }
+    except httpx.HTTPStatusError as e:
+        logger.error("Erro HTTP %s ao consultar DummyJSON: %s", e.response.status_code, e.response.text)
+        return {
+            "sucesso": False,
+            "erro": f"A DummyJSON retornou erro HTTP {e.response.status_code}.",
+            "produtos": []
+        }
+    except Exception as e:
+        logger.error("Falha inesperada ao buscar produtos: %s", str(e))
+        return {
+            "sucesso": False,
+            "erro": f"Falha de comunicação com o catálogo: {str(e)}",
+            "produtos": []
+        }
+
+
+def detalhar_produto(id: int) -> Dict[str, Any]:
+    """
+    Obtém os detalhes completos de um produto específico por ID.
+    """
+    try:
+        produto_id = int(id)
+    except (ValueError, TypeError):
+        return {
+            "sucesso": False,
+            "erro": f"ID de produto inválido: {id}"
+        }
+
+    url = f"{DUMMYJSON_BASE_URL}/products/{produto_id}"
+
+    try:
+        with httpx.Client(timeout=HTTP_TIMEOUT, headers=_get_http_headers()) as client:
+            response = client.get(url)
+            if response.status_code == 404:
+                return {
+                    "sucesso": False,
+                    "erro": f"Produto com ID {produto_id} não foi encontrado no catálogo.",
+                    "produto": None
+                }
+            response.raise_for_status()
+            data = response.json()
+
+            produto_detalhado = {
+                "id": data.get("id"),
+                "title": data.get("title"),
+                "description": data.get("description"),
+                "category": data.get("category"),
+                "price": data.get("price"),
+                "discountPercentage": data.get("discountPercentage"),
+                "rating": data.get("rating"),
+                "stock": data.get("stock"),
+                "brand": data.get("brand"),
+                "sku": data.get("sku"),
+                "weight": data.get("weight"),
+                "warrantyInformation": data.get("warrantyInformation"),
+                "shippingInformation": data.get("shippingInformation"),
+                "availabilityStatus": data.get("availabilityStatus")
+            }
+
+            logger.info("Produto ID %d detalhado com sucesso.", produto_id)
+            return {
+                "sucesso": True,
+                "produto": produto_detalhado
+            }
+
+    except httpx.TimeoutException:
+        logger.error("Timeout ao detalhar produto ID %d na DummyJSON", produto_id)
+        return {
+            "sucesso": False,
+            "erro": f"Tempo limite de {HTTP_TIMEOUT}s excedido ao detalhar produto ID {produto_id}.",
+            "produto": None
+        }
+    except httpx.HTTPStatusError as e:
+        logger.error("Erro HTTP %s ao detalhar produto ID %d", e.response.status_code, produto_id)
+        return {
+            "sucesso": False,
+            "erro": f"Erro HTTP {e.response.status_code} da DummyJSON ao detalhar produto {produto_id}.",
+            "produto": None
+        }
+    except Exception as e:
+        logger.error("Falha inesperada ao detalhar produto ID %d: %s", produto_id, str(e))
+        return {
+            "sucesso": False,
+            "erro": f"Falha ao obter detalhes do produto: {str(e)}",
+            "produto": None
+        }
+
+
+def criar_requisicao(
+    itens: List[Dict[str, Any]],
+    valor_total: float,
+    pedido_original: str = "Solicitação de compra via Agente",
+    solicitante: str = "Usuário",
+    justificativa: str = ""
+) -> Dict[str, Any]:
+    """
+    DIFERENCIAL: Ferramenta MCP para gravação direta da requisição no banco PostgreSQL.
+    O LLM decide quando acionar esta ferramenta após validar produtos e orçamento.
+    """
+    if not itens or not isinstance(itens, list):
+        return {
+            "sucesso": False,
+            "erro": "A requisição deve conter ao menos um item válido."
+        }
+
+    try:
+        valor_total_float = float(valor_total)
+    except (ValueError, TypeError):
+        return {
+            "sucesso": False,
+            "erro": f"Valor total inválido: {valor_total}"
+        }
+
+    conn = None
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            # Insere a requisição principal
+            cur.execute(
+                """
+                INSERT INTO requisicoes (solicitante, pedido_original, resposta_agente, valor_total, status)
+                VALUES (%s, %s, %s, %s, %s)
+                RETURNING id, criado_em;
+                """,
+                (solicitante, pedido_original, justificativa, valor_total_float, "CRIADA")
+            )
+            req_row = cur.fetchone()
+            requisicao_id = req_row["id"]
+
+            itens_inseridos = []
+            for item in itens:
+                produto_id = item.get("produto_id") or item.get("id")
+                produto_nome = item.get("produto_nome") or item.get("title") or item.get("nome") or "Produto sem nome"
+                quantidade = int(item.get("quantidade", 1))
+                preco_unitario = float(item.get("preco_unitario") or item.get("price") or 0.0)
+                subtotal = float(item.get("subtotal") or (quantidade * preco_unitario))
+
+                cur.execute(
+                    """
+                    INSERT INTO itens_requisicao (requisicao_id, produto_id, produto_nome, quantidade, preco_unitario, subtotal)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    RETURNING id;
+                    """,
+                    (requisicao_id, produto_id, produto_nome, quantidade, preco_unitario, subtotal)
+                )
+                itens_inseridos.append({
+                    "produto_id": produto_id,
+                    "produto_nome": produto_nome,
+                    "quantidade": quantidade,
+                    "preco_unitario": preco_unitario,
+                    "subtotal": subtotal
+                })
+
+            conn.commit()
+            logger.info("Requisição #%d criada com sucesso com %d itens. Total: $%.2f", requisicao_id, len(itens_inseridos), valor_total_float)
+
+            return {
+                "sucesso": True,
+                "requisicao_id": requisicao_id,
+                "valor_total": valor_total_float,
+                "total_itens": len(itens_inseridos),
+                "itens": itens_inseridos,
+                "mensagem": f"Requisição #{requisicao_id} criada e registrada no banco de dados com sucesso!"
+            }
+
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        logger.error("Erro ao persistir requisição no banco: %s", str(e))
+        return {
+            "sucesso": False,
+            "erro": f"Erro de banco de dados ao salvar requisição: {str(e)}"
+        }
+    finally:
+        if conn:
+            conn.close()
